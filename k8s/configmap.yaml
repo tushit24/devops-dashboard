@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devops-config
+  labels:
+    app: devops-dashboard
+data:
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  POSTGRES_HOST: "postgres-service"
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: "postgres"
+  POSTGRES_DB: "devops_dashboard"
+  USE_DYNAMODB: "true"
+  AWS_REGION: "ap-south-1"
+  AWS_DEFAULT_REGION: "ap-south-1"
+  PORT: "3000"
+  DASHBOARD_URL: "*"

@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-deployment
+  labels:
+    app: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      imagePullSecrets:
+      - name: regcred
+      containers:
+      - name: worker
+        image: 495398516950.dkr.ecr.ap-south-1.amazonaws.com/devops-dashboard-worker:latest
+        imagePullPolicy: Always
+        envFrom:
+        - configMapRef:
+            name: devops-config
+        - secretRef:
+            name: devops-secrets
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-service
+  labels:
+    app: worker
+spec:
+  ports:
+  - port: 9999
+    targetPort: 9999
+    name: dummy
+  selector:
+    app: worker
+  type: ClusterIP

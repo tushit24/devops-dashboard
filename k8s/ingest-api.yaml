@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-api-deployment
+  labels:
+    app: ingest-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingest-api
+  template:
+    metadata:
+      labels:
+        app: ingest-api
+    spec:
+      imagePullSecrets:
+      - name: regcred
+      containers:
+      - name: ingest-api
+        image: 495398516950.dkr.ecr.ap-south-1.amazonaws.com/devops-dashboard-ingest-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: api
+        envFrom:
+        - configMapRef:
+            name: devops-config
+        - secretRef:
+            name: devops-secrets
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest-api-service
+  labels:
+    app: ingest-api
+spec:
+  ports:
+  - port: 3000
+    targetPort: 3000
+  selector:
+    app: ingest-api
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingest-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingest-api-deployment
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
