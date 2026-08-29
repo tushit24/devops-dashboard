@@ -1,86 +1,167 @@
 # DevOps Dashboard
 
-A real-time DevOps analytics dashboard built to ingest, aggregate, and visualize application logs and metrics. 
+A real-time log ingestion and aggregation platform built as a 3-tier microservices system — containerized with Docker, deployed on Kubernetes with CPU-based autoscaling, backed by AWS DynamoDB, and shipped via an automated CI/CD pipeline to AWS ECR.
 
-## Architecture Overview
+![API Online](docs/screenshots/dashboard-online.png)
+
+---
+
+## Architecture
 
 ```mermaid
 graph TD
-    Client[Client / Ingestion Source] -->|POST /events| IngestAPI[ingest-api Express Server]
-    IngestAPI -->|Push log/metric events| RedisQueue[(Redis Queue)]
-    Worker[worker Node.js Service] -->|Pop events| RedisQueue
-    Worker -->|Aggregate counts & write| PostgresDB[(Postgres DB)]
-    IngestAPI -->|Query stats| PostgresDB
-    Dashboard[dashboard React App] -->|Poll GET /stats every 5s| IngestAPI
+    Client[Browser / Client] -->|POST /events| IngestAPI[ingest-api<br/>Express Server]
+    IngestAPI -->|Push event| Redis[(Redis Queue)]
+    Worker[worker<br/>Node.js Consumer] -->|blPop| Redis
+    Worker -->|Atomic increment| DynamoDB[(AWS DynamoDB<br/>dashboard-stats)]
+    Worker -.->|Fallback mode| Postgres[(PostgreSQL)]
+    IngestAPI -->|GET /stats| DynamoDB
+    IngestAPI -.->|Fallback mode| Postgres
+    Dashboard[dashboard<br/>React + Recharts] -->|Poll every 5s| IngestAPI
+
+    subgraph Kubernetes Cluster
+        IngestAPI
+        Worker
+        Dashboard
+        Redis
+        Postgres
+        HPA[HorizontalPodAutoscaler<br/>2-5 replicas, 50% CPU target] -.->|Watches & scales| IngestAPI
+    end
+
+    subgraph AWS
+        DynamoDB
+        ECR[Elastic Container Registry]
+    end
+
+    GH[GitHub Actions] -->|Build + Push on merge to main| ECR
+    ECR -->|Pull images| Kubernetes
 ```
 
-The system is composed of the following services:
+### Why this shape
 
-1. **`ingest-api`**: Node.js + Express API. Exposes:
-   - `POST /events` to receive event items and enqueue them into Redis.
-   - `GET /stats` to fetch aggregated minute-by-minute metrics from PostgreSQL.
-2. **`worker`**: Node.js microservice that pulls events from the Redis queue, aggregates counts grouped by event type and minute bucket, and inserts them into PostgreSQL with upsert queries.
-3. **`dashboard`**: React single page application built with Vite and styled using a premium modern dark mode theme. Displays real-time charts using Recharts and enables triggering dummy test events right from the UI.
-4. **`Redis`**: In-memory message queue broker.
-5. **`PostgreSQL`**: Relational store for aggregated metrics.
+- **ingest-api** and **worker** are separate services because they have different load profiles — the API needs to respond fast to every incoming write, while the worker does slower aggregation work. Splitting them means a slow aggregation step never blocks incoming events, and a worker crash never takes down the API.
+- **Redis** decouples producer from consumer — if the worker is briefly down or slow, events queue up instead of being dropped or blocking the API.
+- **DynamoDB with atomic `UpdateItem` increments** (not read-then-write) avoids race conditions once multiple worker replicas are involved — a `GetItem` + `PutItem` pattern would lose updates under concurrent writes.
 
 ---
 
-## Getting Started
+## Tech Stack
 
-### Prerequisites
-
-- [Docker](https://www.docker.com/) and Docker Compose installed.
-
-### Setup and Running
-
-1. **Clone the repository and inspect environments**:
-   - Environment variables are predefined inside the services in `docker-compose.yml`.
-   - A [`.env.example`](./.env.example) is provided for custom production reference.
-
-2. **Start the applications**:
-   Run the following command at the root of the workspace to build and run all services in the background:
-   ```bash
-   docker compose up --build -d
-   ```
-
-3. **Verify the services are running**:
-   ```bash
-   docker compose ps
-   ```
-
-4. **Access the services**:
-   - **Dashboard**: `http://localhost`
-   - **Ingest API**: `http://localhost:3000`
+| Layer | Technology |
+|---|---|
+| Frontend | React, Vite, Recharts |
+| Backend | Node.js, Express |
+| Queue | Redis |
+| Database | AWS DynamoDB (on-demand billing), PostgreSQL (local fallback) |
+| Containerization | Docker, multi-stage builds |
+| Orchestration | Kubernetes (minikube locally; portable to EKS) |
+| Cloud | AWS (ECR, DynamoDB, IAM) |
+| CI/CD | GitHub Actions |
 
 ---
 
-## Verifying System Behavior
+## Running Locally (Docker Compose)
 
-### Option A: Using the Dashboard (Recommended)
-Open `http://localhost` in your browser. The dashboard comes with a **Test Event Generator** card. You can click on the buttons to trigger:
-- `Info` events
-- `Warning` events
-- `Error` events
-
-After generating events, wait up to 5 seconds. You will see the event counts updated dynamically in the live bar chart.
-
-### Option B: Using the CLI
-Send a JSON POST request to the API manually:
-
-**PowerShell:**
-```powershell
-Invoke-RestMethod -Uri http://localhost:3000/events -Method Post -Body '{"type":"error","message":"database failed"}' -ContentType 'application/json'
+```bash
+git clone https://github.com/tushit24/devops-dashboard.git
+cd devops-dashboard
+cp .env.example .env   # fill in your own values
+docker compose up --build -d
 ```
 
-**cURL:**
+Open `http://localhost` in your browser. Fire test events using the built-in generator buttons, or:
+
 ```bash
 curl -X POST http://localhost:3000/events \
   -H "Content-Type: application/json" \
-  -d '{"type":"error","message":"database failed"}'
+  -d '{"type":"info","message":"test event"}'
 ```
 
-Verify that the `GET /stats` endpoint returns the aggregate data:
+Set `USE_DYNAMODB=true` in `.env` (with valid AWS credentials) to write to DynamoDB instead of local Postgres.
+
+---
+
+## Running on Kubernetes (minikube)
+
 ```bash
-curl http://localhost:3000/stats
+minikube start --driver=docker
+minikube addons enable metrics-server
+
+# ECR image pull auth (token expires every 12h, re-run as needed)
+kubectl create secret docker-registry regcred \
+  --docker-server=<your-ecr-registry> \
+  --docker-username=AWS \
+  --docker-password=$(aws ecr get-login-password --region ap-south-1)
+
+# Copy k8s/secret.yaml.example -> k8s/secret.yaml and fill in base64-encoded values, then:
+kubectl apply -f k8s/
+
+kubectl get pods
+kubectl get hpa
 ```
+
+Expose services locally (each needs its own terminal open, standard minikube-on-Windows behavior):
+
+```bash
+minikube service ingest-api-service --url
+minikube service dashboard-service --url
+```
+
+---
+
+## Autoscaling Demo (HorizontalPodAutoscaler)
+
+The `ingest-api` Deployment is configured with an HPA targeting 50% CPU utilization, scaling between 2 and 5 replicas.
+
+**Idle state — 2 replicas, low CPU:**
+```
+NAME             REFERENCE                          TARGETS       MINPODS   MAXPODS   REPLICAS
+ingest-api-hpa   Deployment/ingest-api-deployment   cpu: 1%/50%   2         5         2
+```
+
+**Under load — scaled to maximum:**
+```
+NAME             REFERENCE                          TARGETS       MINPODS   MAXPODS   REPLICAS
+ingest-api-hpa   Deployment/ingest-api-deployment   cpu: 1%/50%   2         5         5
+```
+![HPA scaled to 5 replicas](docs/screenshots/hpa-scaled-up.png)
+
+**After load stops — scaled back down automatically:**
+```
+NAME             REFERENCE                          TARGETS       MINPODS   MAXPODS   REPLICAS
+ingest-api-hpa   Deployment/ingest-api-deployment   cpu: 1%/50%   2         5         2
+```
+![HPA scaled back to 2 replicas](docs/screenshots/hpa-scaled-down.png)
+
+This was verified with a real load test against the live cluster — not simulated. metrics-server was enabled as a minikube addon to provide the CPU data the HPA reads from.
+
+---
+
+## CI/CD (GitHub Actions)
+
+Every push to `main` triggers [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), which:
+
+1. Builds Docker images for all three services
+2. Authenticates with AWS ECR
+3. Pushes each image tagged with the **short git commit SHA** (not `latest`)
+
+Commit-SHA tagging means every deployed image traces back to an exact commit — useful for rollbacks and knowing precisely what code is running in the cluster at any time.
+
+
+
+---
+
+## Security Notes
+
+- AWS access is scoped to a dedicated IAM user with a least-privilege custom policy — limited to ECR push/pull and access to a single named DynamoDB table, not full account access.
+- Real credentials (`.env`, `k8s/secret.yaml`) are gitignored; only `.example` templates with placeholder values are committed.
+- DynamoDB runs in on-demand (`PAY_PER_REQUEST`) billing mode to avoid hourly charges for an idle side project.
+- This project intentionally avoids EKS and EC2 to prevent unnecessary AWS cost — Kubernetes runs locally via minikube, using the same manifest syntax that would apply to a production EKS cluster.
+
+---
+
+## What I'd change for production
+
+- Replace the local `minikube service --url` tunnel workflow with a proper Ingress controller and stable DNS, removing the need to rebuild the frontend image every time a backend URL changes.
+- Move Secrets management to AWS Secrets Manager or an External Secrets Operator instead of raw base64 Kubernetes Secrets.
+- Add a Horizontal Pod Autoscaler for the `worker` service as well, scaled on Redis queue depth rather than CPU.
